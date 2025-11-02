@@ -1,9 +1,10 @@
-# app.py — Project Samarth (Final UI with saffron section titles)
+# app.py — Project Samarth (Final UI with saffron section titles, in-memory Chroma)
 import sys
 import os
 import json
 import logging
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -13,6 +14,8 @@ from langchain.prompts import PromptTemplate
 from langchain.chains import RetrievalQA
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
+
+# Keep your config import (we won't use CHROMA_DB_PATH now, but it's fine)
 from config import *  # CHROMA_DB_PATH, COLLECTION_NAME, GROQ_API_KEY
 
 # ====== Env & Logging ======
@@ -27,6 +30,10 @@ GROQ_KEY = RAW_GROQ_KEY if is_valid_groq_key(RAW_GROQ_KEY) else ""
 sys.setrecursionlimit(3000)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Resolve path to data/processed/documents.json robustly (works when nested)
+BASE_DIR = Path(__file__).resolve().parent
+DATA_JSON = BASE_DIR / "data" / "processed" / "documents.json"
 
 # ====== Page Setup ======
 st.set_page_config(page_title="Project Samarth", page_icon="🇮🇳", layout="wide")
@@ -119,27 +126,111 @@ st.markdown(
 if not GROQ_KEY:
     st.warning("No valid GROQ_API_KEY found — Q&A is disabled. Add it in Secrets to enable answers.")
 
-# ====== Core: VectorStore & optional LLM ======
-@st.cache_resource(ttl=3600)
+# ====== Robust record loader (list, dict, NDJSON; metadata-aware) ======
+def _iter_records(json_path: Path):
+    if not json_path.exists():
+        raise FileNotFoundError(f"Missing {json_path}. Add it to the repo.")
+    with json_path.open("r", encoding="utf-8") as f:
+        first = f.read(1); f.seek(0)
+        if first in ["[", "{"]:
+            obj = json.load(f)
+            if isinstance(obj, list):
+                for r in obj:
+                    if isinstance(r, dict):
+                        yield r
+            elif isinstance(obj, dict):
+                # common container keys
+                for k in ("data", "records", "items", "documents"):
+                    if isinstance(obj.get(k), list):
+                        for r in obj[k]:
+                            if isinstance(r, dict):
+                                yield r
+        else:
+            # NDJSON
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                    if isinstance(r, dict):
+                        yield r
+                except Exception:
+                    continue
+
+def _lower_keys(d: dict) -> dict:
+    return { (k.lower() if isinstance(k, str) else k): v for k, v in (d or {}).items() }
+
+def _pick(meta: dict, *names):
+    """Return first present key among name variants (case-insensitive)."""
+    m = _lower_keys(meta)
+    for n in names:
+        if n.lower() in m:
+            return m[n.lower()]
+    return ""
+
+def _compose_text(meta: dict) -> str:
+    return (
+        f"{_pick(meta,'commodity')} ({_pick(meta,'variety')}) at {_pick(meta,'market')}, "
+        f"{_pick(meta,'district')}, {_pick(meta,'state')} on {_pick(meta,'arrival_date','date')} — "
+        f"min {_pick(meta,'min_price')}, max {_pick(meta,'max_price')}, modal {_pick(meta,'modal_price')}."
+    )
+
+# ====== Build in-memory vector store from documents.json ======
+@st.cache_resource(ttl=1800, show_spinner=True)
+def build_vectorstore_in_memory():
+    logger.info(f"Building in-memory index from: {DATA_JSON}")
+    texts, metas = [], []
+    count = 0
+
+    for rec in _iter_records(DATA_JSON):
+        count += 1
+        # Records might have separate 'metadata' and 'page_content'
+        if isinstance(rec.get("metadata"), dict):
+            meta = dict(rec["metadata"])  # copy
+        else:
+            meta = dict(rec)
+
+        # Canonical metadata fields (case-insensitive)
+        norm = {
+            "state": _pick(meta, "state", "STATE"),
+            "district": _pick(meta, "district", "DISTRICT"),
+            "market": _pick(meta, "market", "MARKET"),
+            "commodity": _pick(meta, "commodity", "COMMODITY"),
+            "variety": _pick(meta, "variety", "VARIETY"),
+            "grade": _pick(meta, "grade", "GRADE"),
+            "arrival_date": _pick(meta, "arrival_date", "date", "DATE"),
+            "min_price": _pick(meta, "min_price", "MIN_PRICE"),
+            "max_price": _pick(meta, "max_price", "MAX_PRICE"),
+            "modal_price": _pick(meta, "modal_price", "MODAL_PRICE"),
+        }
+
+        # Prefer document text if present
+        text = rec.get("page_content") or rec.get("text") or rec.get("content")
+        if not isinstance(text, str) or not text.strip():
+            text = _compose_text(norm)
+
+        texts.append(text)
+        metas.append(norm)
+
+    logger.info(f"Loaded {count} raw records; built {len(texts)} in-memory documents.")
+
+    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+    # Pure in-memory Chroma: no persist_directory, no client, no sqlite
+    vectorstore = Chroma.from_texts(
+        texts=texts,
+        embedding=embeddings,
+        metadatas=metas,
+        collection_name="mandi_mem",  # distinct from any persisted name
+    )
+    return vectorstore
+
+# ====== QA system using in-memory retriever ======
+@st.cache_resource(ttl=1800, show_spinner=True)
 def initialize_qa_system():
     try:
-        # Log where we load from
-        logger.info(f"Using Chroma at: {CHROMA_DB_PATH}")
-        logger.info(f"Collection: {COLLECTION_NAME}")
-        logger.info(f"chroma_db exists? {os.path.isdir(CHROMA_DB_PATH)}")
-        try:
-            logger.info(f"chroma_db files: {os.listdir(CHROMA_DB_PATH)}")
-        except Exception as e:
-            logger.warning(f"Could not list chroma_db files: {e}")
-
-        embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-
-        # CRITICAL: load the existing persisted DB (do NOT create a fresh client-only collection)
-        vectorstore = Chroma(
-            collection_name=COLLECTION_NAME,
-            embedding_function=embeddings,
-            persist_directory=CHROMA_DB_PATH,
-        )
+        vectorstore = build_vectorstore_in_memory()
 
         llm = None
         if GROQ_KEY:
@@ -181,7 +272,8 @@ def build_rows_from_sources(result_dict, limit=30):
         m = d.metadata or {}
         key = (m.get("state",""), m.get("district",""), m.get("market",""),
                m.get("commodity",""), m.get("arrival_date",""))
-        if key in seen: continue
+        if key in seen:
+            continue
         seen.add(key)
         rows.append({
             "State": m.get("state",""),
@@ -205,7 +297,7 @@ with st.sidebar:
 
     st.markdown("### ⚙️ System Status")
     st.write(f"LLM Key: {'✅ Active' if GROQ_KEY else '⚠️ Missing'}")
-    st.write("Vector DB: ✅ Chroma (prebuilt, persisted)")
+    st.write("Vector DB: ✅ Chroma (in-memory from JSON)")
     st.divider()
     st.caption("All processing is local. `.env`/Secrets store keys. CSV export enabled. Citations attached.")
 
@@ -244,7 +336,7 @@ with tab_qa:
         value=st.session_state.get("current_question", ""),
         height=90,
         placeholder="e.g., Modal price of tomato in Chittoor on 25/10/2025?",
-        label_visibility="collapsed",              # keep it visually hidden if you prefer
+        label_visibility="collapsed",              # hides visually, keeps accessible
     )
 
     go = st.button("🔎 Get Answer", disabled=(not GROQ_KEY))
@@ -256,7 +348,7 @@ with tab_qa:
             else:
                 result = qa_chain.invoke({"query": user_q})
                 st.markdown("#### Answer")
-                st.write(result["result"])
+                st.write(result.get("result", "").strip() or "No answer generated.")
 
                 st.markdown("#### Details (top matches)")
                 rows = build_rows_from_sources(result, limit=30)
