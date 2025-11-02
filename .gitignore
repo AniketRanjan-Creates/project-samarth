@@ -1,0 +1,38 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+
+# LangChain / Chroma cache
+chroma_db/
+*.parquet
+*.arrow
+
+# Data
+data/raw/*.csv
+data/processed/*.csv
+!data/processed/documents.json  # keep this file tracked
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
