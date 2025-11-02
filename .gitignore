@@ -15,7 +15,7 @@ build/
 .env
 
 # LangChain / Chroma cache
-chroma_db/
+
 *.parquet
 *.arrow
 
