@@ -7,18 +7,17 @@ from datetime import datetime
 
 import pandas as pd
 import streamlit as st
-import chromadb
 
 from dotenv import load_dotenv
 from langchain.prompts import PromptTemplate
 from langchain.chains import RetrievalQA
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from config import *  # CHROMA_DB_PATH, COLLECTION_NAME
+from config import *  # CHROMA_DB_PATH, COLLECTION_NAME, GROQ_API_KEY
 
 # ====== Env & Logging ======
 load_dotenv()
-RAW_GROQ_KEY = os.getenv("GROQ_API_KEY", "")
+RAW_GROQ_KEY = os.getenv("GROQ_API_KEY", GROQ_API_KEY or "")
 
 def is_valid_groq_key(k: str) -> bool:
     return isinstance(k, str) and k.startswith("gsk_") and len(k) > 8
@@ -118,16 +117,29 @@ st.markdown(
 )
 
 if not GROQ_KEY:
-    st.warning("No valid GROQ_API_KEY found — Q&A is disabled. Add it in `.env` to enable answers.")
+    st.warning("No valid GROQ_API_KEY found — Q&A is disabled. Add it in Secrets to enable answers.")
 
 # ====== Core: VectorStore & optional LLM ======
 @st.cache_resource(ttl=3600)
 def initialize_qa_system():
     try:
-        chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-        _ = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
+        # Log where we load from
+        logger.info(f"Using Chroma at: {CHROMA_DB_PATH}")
+        logger.info(f"Collection: {COLLECTION_NAME}")
+        logger.info(f"chroma_db exists? {os.path.isdir(CHROMA_DB_PATH)}")
+        try:
+            logger.info(f"chroma_db files: {os.listdir(CHROMA_DB_PATH)}")
+        except Exception as e:
+            logger.warning(f"Could not list chroma_db files: {e}")
+
         embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-        vectorstore = Chroma(client=chroma_client, collection_name=COLLECTION_NAME, embedding_function=embeddings)
+
+        # CRITICAL: load the existing persisted DB (do NOT create a fresh client-only collection)
+        vectorstore = Chroma(
+            collection_name=COLLECTION_NAME,
+            embedding_function=embeddings,
+            persist_directory=CHROMA_DB_PATH,
+        )
 
         llm = None
         if GROQ_KEY:
@@ -193,9 +205,9 @@ with st.sidebar:
 
     st.markdown("### ⚙️ System Status")
     st.write(f"LLM Key: {'✅ Active' if GROQ_KEY else '⚠️ Missing'}")
-    st.write("Vector DB: ✅ Chroma (local, persistent)")
+    st.write("Vector DB: ✅ Chroma (prebuilt, persisted)")
     st.divider()
-    st.caption("All processing is local. `.env` stores keys. CSV export enabled. Citations attached.")
+    st.caption("All processing is local. `.env`/Secrets store keys. CSV export enabled. Citations attached.")
 
     # Bottom-left flag
     st.markdown(
@@ -228,10 +240,11 @@ with tab_qa:
 
     st.markdown('<div class="section-title">Your Question</div>', unsafe_allow_html=True)
     user_q = st.text_area(
-        label="",
+        label="Your Question",                     # non-empty to avoid Streamlit warning
         value=st.session_state.get("current_question", ""),
         height=90,
         placeholder="e.g., Modal price of tomato in Chittoor on 25/10/2025?",
+        label_visibility="collapsed",              # keep it visually hidden if you prefer
     )
 
     go = st.button("🔎 Get Answer", disabled=(not GROQ_KEY))
@@ -239,7 +252,7 @@ with tab_qa:
         with st.spinner("Reasoning over indexed mandi data…"):
             qa_chain, _ = initialize_qa_system()
             if qa_chain is None:
-                st.warning("LLM is disabled or failed to initialize. Add a valid GROQ_API_KEY in `.env`.")
+                st.warning("LLM is disabled or failed to initialize. Add a valid GROQ_API_KEY in Secrets.")
             else:
                 result = qa_chain.invoke({"query": user_q})
                 st.markdown("#### Answer")
